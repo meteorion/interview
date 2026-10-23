@@ -36,6 +36,10 @@ Oct 15, 2026 · @meteorzhong
 
 **final 与 static【重点】**：final 类不能继承、方法不能重写、变量只能赋值一次（引用不可变，对象内容可变）；static 属于类而非实例，静态方法不能访问实例成员，静态代码块在类初始化时执行一次。
 
+**访问修饰符【了解】**：`private`（本类）→ 默认（同包）→ `protected`（同包 + 子类）→ `public`（全部）。接口方法默认 public，实现时不能降低可见性。
+
+**Object 的常用方法【了解】**：`equals` / `hashCode`（重写必须成对，见 1.3）、`toString`（默认输出类名@哈希，日志里建议重写）、`clone`（浅拷贝，需实现 `Cloneable`）、`finalize`（已废弃，不要使用）、`wait` / `notify`（属于对象锁机制，见并发文档）。
+
 ### 1.2 String【核心】
 
 **不可变**：`String` 类是 final 的，内部字符数组 `private final`，且没有提供修改方法。JDK 9 起内部由 `char[]` 改为 `byte[]` + 编码标记（紧凑字符串），纯 Latin-1 字符串只占一半内存。
@@ -90,6 +94,30 @@ System.out.println(a == d.intern()); // true
 - **反射**：运行时通过 `Class` 对象获取类的信息并操作字段、方法、构造器。获取 Class 的三种方式：`Xxx.class`、`obj.getClass()`、`Class.forName("...")`（会触发类初始化）。是 Spring IOC、AOP、MyBatis 等框架的基础。代价是性能较差（无法内联、有权限检查）和破坏封装。JDK 9 的模块系统限制了对 JDK 内部类的反射访问。
 - **深拷贝与浅拷贝**：浅拷贝只复制引用，新旧对象共享内部对象；深拷贝递归复制所有对象。`Object.clone()` 默认是浅拷贝；深拷贝可用序列化或手写拷贝构造器。
 - **序列化【了解】**：实现 `Serializable`；显式声明 `serialVersionUID`，否则类结构一变，自动生成的 UID 就变，反序列化失败；`transient` 字段不参与序列化。实际项目中更常用 JSON、Protobuf 等。
+
+### 1.7 内部类与枚举【了解】
+
+**四种内部类**：
+
+| 类型 | 特点 | 典型用途 |
+| --- | --- | --- |
+| 成员内部类 | 持有外部类实例引用，可直接访问外部成员；`外部类.this` 指代外部对象 | 强耦合的辅助类 |
+| 静态内部类 | 不持有外部引用，可独立创建；`Outer.Inner` | 静态内部类单例、Builder |
+| 局部内部类 | 定义在方法内，可访问 effectively final 的局部变量 | 极少使用 |
+| 匿名内部类 | 没有类名，一次性实现接口或继承类；会生成 `Outer$1.class` | 回调、线程 Runnable |
+
+注意：非静态内部类不能有静态成员（常量除外）；匿名内部类与 Lambda 的区别已在 2.3 说明。
+
+**枚举**：本质是继承 `java.lang.Enum` 的 final 类，每个枚举值都是静态单例。自带 `values()`、`valueOf()`、`name()`、`ordinal()`；可以定义字段、构造器和方法，因此能承载状态与行为（比 int 常量安全，避免非法值）。枚举单例天然线程安全，且能防反射（`newInstance` 抛异常）和反序列化破坏（返回同一实例）；`EnumSet` / `EnumMap` 是专为枚举优化的高性能集合。
+
+### 1.8 SPI 机制【了解】
+
+SPI（Service Provider Interface）是「接口在调用方、实现在提供方」的扩展机制：调用方只依赖接口，运行时从 classpath 发现实现。
+
+- **用法**：在 `META-INF/services/` 下建以接口全限定名命名的文件，内容是实现类全名；`ServiceLoader.load(Xxx.class)` 遍历加载并实例化。
+- **为什么需要它**：父加载器（启动类加载器）加载了接口，却看不到子加载器（应用类加载器）里的实现，所以 `ServiceLoader` 用**线程上下文类加载器**来加载实现类，这也是「打破双亲委派」的典型场景。
+- **典型应用**：JDBC 的 `DriverManager`（各数据库驱动 jar 内声明 `java.sql.Driver` 实现）、Dubbo 扩展点（`@SPI` / `@Adaptive`）、Spring Boot 3 的 `AutoConfiguration.imports`（思路与 SPI 相同）。
+- **局限**：会一次性实例化所有实现、无法按名称或优先级选择；Dubbo SPI 做了改进（按名加载、支持 IOC / AOP、用 Wrapper 包装）。
 
 ## 二、泛型、注解与函数式编程
 
@@ -189,6 +217,21 @@ Lambda 是函数式接口（只有一个抽象方法的接口，可加 `@Functio
 - `subList()` 返回的是原列表的视图，修改原列表结构后再操作它会抛异常。
 - `list.toArray(new String[0])` 传空数组即可，性能不差。
 
+### 3.6 Iterator 与 Comparable / Comparator【了解】
+
+**Iterator**：`Collection` 继承 `Iterable`，遍历统一走 `hasNext()` / `next()` / `remove()`；增强 for 循环编译后就是用迭代器。`remove()` 是迭代过程中安全删除元素的唯一方式（直接调 `list.remove` 会触发 fail-fast，见 3.4）。`ListIterator` 额外支持双向遍历和 `set` / `add`。
+
+**Comparable 与 Comparator**：
+
+| 维度 | Comparable | Comparator |
+| --- | --- | --- |
+| 位置 | 实现在元素类内部 | 独立的比较器对象 |
+| 方法 | `compareTo(T o)` | `compare(T a, T b)` |
+| 排序 | 自然排序，只有一种 | 可定义多种排序 |
+| 使用 | `TreeMap` / `TreeSet` 默认使用 | 可传入 `TreeMap` 构造器、`sort`、`Stream.sorted` |
+
+优先用 `Comparator`：`Comparator.comparing(Order::getAmount).reversed().thenComparing(Order::getId())`，还可配合 `nullsFirst` / `nullsLast`。注意 `compareTo` 与 `equals` 的一致性——`BigDecimal` 就是 `compareTo` 忽略精度而 `equals` 比较精度，放进 `TreeSet` 和 `HashSet` 行为会不同。
+
 ## 四、HashMap 与其他 Map
 
 HashMap 是集合部分的重中之重，面试常从它一路追问到 ConcurrentHashMap。以下以 JDK 8 为准。
@@ -246,6 +289,10 @@ static final int hash(Object key) {
 | null key / value | 允许 / 允许 | 不允许 | 允许 | key 不允许 | 不允许 |
 | 线程安全 | 否 | 是（全表锁） | 否 | 否 | 是（CAS + 桶锁） |
 | 复杂度 | O(1) | O(1) | O(1) | O(log n) | O(1) |
+
+**WeakHashMap【了解】**：key 是**弱引用**，当 key 不再被外部强引用时，GC 会回收它，对应的 entry 随之被移除（内部用 `ReferenceQueue` 清理）。适合做「附加在对象上的元数据」这类缓存；注意 value 不能强引用 key，否则形成循环引用导致永远无法回收，而且 `size()` 的结果随时可能变化，不能用于需要精确计数的场景。
+
+**ConcurrentHashMap 的版本差异**：JDK 7 是 Segment 分段锁（默认 16 段，锁粒度是段）；JDK 8 改为「CAS + synchronized 锁单个桶头节点」，并发度等于桶数量，并引入 `ForwardingNode` 协助扩容、`sizeCtl` 控制初始化与扩容状态。详见并发文档。
 
 **用 LinkedHashMap 实现 LRU 缓存【重点】**：
 

@@ -9,12 +9,12 @@ Oct 14, 2026 · @meteorzhong
 | 图谱节点 | 级别 | 本文章节 |
 | --- | --- | --- |
 | MySQL（mysql） | 核心 | 架构与存储引擎、日志、Buffer Pool、主从复制 |
-| 索引与 B+ 树（index） | 核心 | 索引、SQL 优化 |
+| 索引与 B+ 树（index） | 核心 | 索引、SQL 基础与优化 |
 | 事务与 MVCC（transaction） | 核心 | 事务、锁 |
 | 分库分表（sharding） | 重点 | 高可用与扩展 |
 | 连接池（connection-pool） | 重点 | 表设计与规范 · 连接池 |
 
-**复习顺序**：架构 → 索引 → 事务与 MVCC → 锁 → 日志 → SQL 优化 → Buffer Pool → 主从与分库分表。索引、MVCC、三大日志是面试出现频率最高的三块，建议优先吃透。
+**复习顺序**：架构 → 索引 → 事务与 MVCC → 锁 → 日志 → SQL 基础与优化 → Buffer Pool → 主从与分库分表。索引、MVCC、三大日志是面试出现频率最高的三块，建议优先吃透。
 
 ## 一、架构与存储引擎
 
@@ -53,6 +53,10 @@ MySQL 分为 Server 层和可插拔的存储引擎层：Server 层负责连接�
 ### 1.3 InnoDB 存储结构【重点】
 
 表空间 → 段（Segment）→ 区（Extent，1 MB，连续 64 页）→ **页（Page，默认 16 KB，磁盘与内存交互的最小单位）**→ 行。行格式默认 `DYNAMIC`，每行有隐藏字段 `DB_TRX_ID`（最近修改的事务 ID）、`DB_ROLL_PTR`（指向 undo log 的回滚指针），没有主键时还有 `DB_ROW_ID`。这两个字段是 MVCC 的基础。
+
+**页分裂与页合并【了解】**：页内的记录按主键有序存放。乱序插入主键（如 UUID）时目标页可能已满，InnoDB 会把该页分裂成两页并搬移部分记录，造成写入放大和空间碎片；大量删除后相邻页利用率过低时会触发页合并，阈值由 `MERGE_THRESHOLD`（默认 50%）控制。这是「推荐自增主键」的底层原因。
+
+**行溢出【了解】**：一页至少要能放下两行，VARCHAR、TEXT 等大字段可能让一页放不下两行。`DYNAMIC` 行格式下超长列只存 20 字节指针，数据全部放到溢出页（老的 `COMPACT` 格式存前 768 字节 + 指针）。行溢出多意味着读一行要追额外的页，这也是大字段要拆扩展表的原因之一。
 
 ## 二、索引
 
@@ -123,6 +127,11 @@ MySQL 5.6 引入。以索引 `(name, age)` 和 `WHERE name LIKE '张%' AND age =
 ### 2.7 优化器选错索引【了解】
 
 统计信息是采样估算的，可能不准。处理顺序：`ANALYZE TABLE` 重新统计 → 改写 SQL 引导优化器 → `FORCE INDEX(idx)` 强制指定（应急手段，索引改名后会报错）。
+
+### 2.8 索引合并与 MRR【了解】
+
+- **索引合并（index merge）**：优化器有时会对同一表的多个二级索引分别扫描，再对主键取交集（intersection）或并集（union），EXPLAIN 的 type 显示 `index_merge`，Extra 显示 `Using intersect(...)` / `Using union(...)`。能用上索引合并通常说明索引设计不佳，多数情况下一个覆盖全部条件的联合索引效率更高。
+- **MRR（Multi-Range Read）**：针对回表优化的机制。范围查询时先把二级索引查到的主键收集到 `read_rnd_buffer` 中排序，再按主键顺序回表，把随机 I/O 变成相对顺序的 I/O。Extra 显示 `Using MRR`。默认开启，由优化器决定是否使用。
 
 ## 三、事务与 MVCC
 
@@ -326,11 +335,46 @@ redo log 由多个文件循环使用，`write pos` 是当前写位置，`checkpo
 
 undo log 分为 insert undo（事务提交后即可删除）和 update undo（要等没有 ReadView 引用后由 purge 线程清理）。DELETE 并不立即物理删除，而是打上删除标记，等 purge 时才真正删除。长事务会阻塞 purge，导致 undo 膨胀。
 
-## 六、SQL 优化
+### 5.6 备份与恢复【了解】
+
+- **逻辑备份 mysqldump**：导出 SQL 文本，恢复慢，适合中小库。InnoDB 用 `--single-transaction` 开 RR 事务拿一致性快照，备份期间不锁表；MyISAM 没有事务，只能 `FLUSH TABLES WITH READ LOCK` 全局只读来备。
+- **物理备份 XtraBackup（Percona 开源）**：直接拷贝数据文件，备份期间持续拷贝 redo log 来追平并发修改，恢复时先做类似崩溃恢复的 redo 应用。支持热备、增量备份，大库首选。
+- **按时间点恢复（PITR）**：最近一次全量备份 + 从备份位点开始回放 binlog（`mysqlbinlog`）。误删表时的做法：恢复到删表前的位点即截断回放，跳过事故 SQL 后再继续。
+
+## 六、SQL 基础与优化
 
 慢 SQL 优化的主线是：用慢查询日志找到 SQL → 用 EXPLAIN 看执行计划 → 针对 type、rows、Extra 中的问题加索引或改写 SQL → 验证。
 
-### 6.1 EXPLAIN 关键字段【核心】
+### 6.1 SQL 基础要点【重点】
+
+对齐《Java开发工程师核心知识点.md》第六章的 SQL 基础，面试多为手写 SQL，记住以下要点。
+
+**一条 SELECT 的逻辑执行顺序**：`FROM`（含 JOIN、ON）→ `WHERE` → `GROUP BY` → `HAVING` → `SELECT`（含 DISTINCT）→ `ORDER BY` → `LIMIT`。因此 WHERE 中不能使用 SELECT 里定义的别名，HAVING 中可以。
+
+**JOIN 类型**：
+
+| 类型 | 结果 |
+| --- | --- |
+| `INNER JOIN` | 两边都匹配的行 |
+| `LEFT JOIN` | 左表全部 + 右表匹配的行，不匹配处补 NULL |
+| `RIGHT JOIN` | 右表全部 + 左表匹配的行 |
+| 全连接 | MySQL 不支持 `FULL JOIN`，用 `LEFT JOIN ... UNION ... RIGHT JOIN` 模拟 |
+
+常见坑：`LEFT JOIN` 时右表的过滤条件写在 `ON` 里不影响左表行数；写在 `WHERE` 里会把补 NULL 的行过滤掉，效果退化成 `INNER JOIN`。
+
+**子查询与聚合**：相关子查询对驱动表逐行执行，数据量大时优先改写为 JOIN 或派生表；默认 `ONLY_FULL_GROUP_BY` 模式下，SELECT 中的列必须出现在 GROUP BY 中或被聚合函数包裹（否则用 `ANY_VALUE()`）。
+
+**窗口函数（8.0）**：`ROW_NUMBER() / RANK() / DENSE_RANK() / LAG() / LEAD() / SUM() OVER (...)`，在不折叠行的前提下实现组内排名、求累计值、取相邻行。典型面试题是「每组取 Top N」：
+
+```sql
+-- 每个部门工资最高的 3 人
+SELECT * FROM (
+  SELECT *, DENSE_RANK() OVER (PARTITION BY dept ORDER BY salary DESC) AS rk
+  FROM emp
+) t WHERE rk <= 3;
+```
+
+### 6.2 EXPLAIN 关键字段【核心】
 
 | 字段 | 含义 | 关注点 |
 | --- | --- | --- |
@@ -354,7 +398,7 @@ undo log 分为 insert undo（事务提交后即可删除）和 update undo（�
 
 8.0.18 起可用 `EXPLAIN ANALYZE` 实际执行并输出每步真实耗时和行数。
 
-### 6.2 慢 SQL 定位与优化思路【核心】
+### 6.3 慢 SQL 定位与优化思路【核心】
 
 1. **开启慢查询日志**：`slow_query_log=ON`、`long_query_time=1`（秒），可加 `log_queries_not_using_indexes`。
 2. **分析日志**：用 `mysqldumpslow` 或 `pt-query-digest` 按总耗时、执行次数排序。
@@ -364,7 +408,16 @@ undo log 分为 insert undo（事务提交后即可删除）和 update undo（�
 
 除了索引问题，慢 SQL 还可能来自：锁等待（查 `innodb_trx`、`data_lock_waits`）、刷脏页导致的抖动、Buffer Pool 太小、磁盘 I/O 打满。
 
-### 6.3 深分页优化【重点】
+### 6.4 ORDER BY 与 filesort【了解】
+
+ORDER BY 用不上索引顺序时走 filesort（不一定写磁盘，结果集能放进 `sort_buffer_size` 时在内存中排）：
+
+- **双路排序（回表排序）**：先按条件读出排序字段和主键，排序后再按主键回表取整行。排序缓冲区占用小，但回表是随机 I/O。
+- **单路排序**：一次读出查询所需的全部列，在 sort buffer 中排序后直接返回。MySQL 优先用单路，单行长度超过 `max_length_for_sort_data`（默认 4 KB，典型的是含大 TEXT 列）时退回双路。
+
+优化方向：让联合索引的列顺序同时满足 WHERE 等值条件和 ORDER BY（等值列在前、排序列在后）；`ORDER BY a ASC, b DESC` 这种混合升降序在 8.0 前无法走索引，8.0 可以建降序索引解决；避免 `SELECT *`，防止单行过大退回双路；必要时调大 `sort_buffer_size` 避免磁盘临时文件。
+
+### 6.5 深分页优化【重点】
 
 `SELECT * FROM orders ORDER BY id LIMIT 1000000, 10` 会读取并丢弃前 100 万行，而且每行都要回表。
 
@@ -379,17 +432,17 @@ SELECT * FROM orders WHERE id > #{lastId} ORDER BY id LIMIT 10;
 
 产品层面也可以限制最大页数，或把深度检索交给 ES（用 search\_after）。
 
-### 6.4 count 的性能【重点】
+### 6.6 count 的性能【重点】
 
 性能大致为 `count(*)` ≈ `count(1)` > `count(主键)` > `count(字段)`。`count(*)` 是 SQL 标准写法，InnoDB 做了专门优化，会选择最小的二级索引来遍历；`count(字段)` 还要判断是否为 NULL。大表精确计数很慢，可用 Redis 计数、单独的计数表，或在允许近似时用 `EXPLAIN` 的 rows 或 `information_schema.tables` 估算值。
 
-### 6.5 Join 优化【重点】
+### 6.7 Join 优化【重点】
 
 - **小表驱动大表**：这里的「小」是指按条件过滤后参与 Join 的数据量小。
 - **被驱动表的 Join 字段必须有索引**：有索引时是 Index Nested-Loop Join；没有时 8.0.18 之前用 Block Nested-Loop，8.0.18 起改为 Hash Join。
 - 不要 Join 太多表（《阿里巴巴 Java 开发手册》建议不超过 3 个），可以拆成多次单表查询在应用层组装。
 
-### 6.6 其他常见优化【重点】
+### 6.8 其他常见优化【重点】
 
 - 避免 `SELECT *`，只取需要的列，便于覆盖索引。
 - 大批量 INSERT 用多值插入，每批 500\~1000 行；大批量 DELETE / UPDATE 分批执行，避免长事务和主从延迟。
@@ -470,6 +523,8 @@ SQL 偶发变慢、抖动，常见原因就是前两种情况触发了集中刷�
 
 **何时拆**：《阿里巴巴 Java 开发手册》建议单表超过 500 万行或 2 GB 时考虑分表。这是经验值，真正的判断依据是索引是否还能放进 Buffer Pool、写入 TPS 是否到单机上限。优先顺序：SQL 与索引优化 → 缓存 → 读写分离 → 分库分表。
 
+**分库分表前可考虑分区表【了解】**：`PARTITION BY RANGE / HASH / LIST (...)` 把一张表在存储层切成多个分区，对应用完全透明；查询命中分区裁剪（pruning）时只扫描相关分区，删除历史数据可以直接 `DROP PARTITION` 而不是 DELETE。局限：所有分区仍在同一实例，写入瓶颈、DDL 阻塞、单点问题依旧；主键和唯一键必须包含分区键。它解决的是「单表数据量」，不解决「并发写入」，到达单机写上限后仍要水平分库。
+
 | 拆分方式 | 做法 | 解决的问题 |
 | --- | --- | --- |
 | 垂直分库 | 按业务拆：用户库、订单库、商品库 | 业务解耦，分散压力；配合微服务 |
@@ -538,6 +593,8 @@ SQL 偶发变慢、抖动，常见原因就是前两种情况触发了集中刷�
 - **核心参数（HikariCP）**：`maximumPoolSize`、`minimumIdle`、`connectionTimeout`（取连接超时，默认 30 秒）、`maxLifetime`（应小于 MySQL 的 `wait_timeout`）、`leakDetectionThreshold`（连接泄漏检测）。
 - **池大小**：不是越大越好。HikariCP 官方建议的起点公式是 `连接数 = CPU 核数 × 2 + 有效磁盘数`。还要保证「应用实例数 × 每实例池大小 < MySQL `max_connections`」。
 - **Druid**：特点是自带监控页面、SQL 统计和 SQL 防火墙，在国内项目中常见。
+- **HikariCP 为什么快【了解】**：① 自研 `ConcurrentBag` 管理连接，ThreadLocal 缓存 + CAS 借还，避开了 C3P0、Druid 基于锁的连接管理；② 自研 `FastList` 替代 ArrayList，去掉下标范围检查；③ 用 Javassist 生成精简字节码做代理，方法调用层级少、体积小。差距在高并发短操作时最明显，普通场景几个主流连接池差异不大。
+- **连接泄漏定位【重点】**：连接被借出后未归还（手动 `getConnection` 后漏了 close、异常路径绕过关闭逻辑），池耗尽后所有请求卡在取连接上。排查手段：HikariCP 设置 `leakDetectionThreshold`（如 30000 ms），连接借出超过该时间未归还就打印借出点的堆栈，按堆栈即可定位到未关闭的代码。注意该检测有开销，建议测试环境常开、生产环境排查时临时开启；同时可配合 `SHOW PROCESSLIST` 看大量 Sleep 连接佐证。
 
 ## 十、高频面试题与自测清单
 
@@ -568,7 +625,7 @@ SQL 偶发变慢、抖动，常见原因就是前两种情况触发了集中刷�
 | 19 | 主从复制原理与延迟怎么处理？ | binlog dump / I/O / SQL 三线程；大事务、并行复制、强制读主 | 八 |
 | 20 | 什么时候分库分表？带来哪些问题？ | 数据量 / 写入瓶颈；全局 ID、跨库查询、分布式事务、扩容 | 八 |
 
-**加分题**：为什么推荐自增主键？Change Buffer 为什么只用于非唯一索引？InnoDB 的 LRU 做了哪些改进？count(\*) 为什么慢？为什么很多公司把隔离级别改为 RC？
+**加分题**：为什么推荐自增主键？Change Buffer 为什么只用于非唯一索引？InnoDB 的 LRU 做了哪些改进？count(\*) 为什么慢？为什么很多公司把隔离级别改为 RC？HikariCP 为什么比其他连接池快？分区表能替代分库分表吗？「每组取 Top N」用窗口函数怎么写？
 
 ### 10.2 动手实验
 

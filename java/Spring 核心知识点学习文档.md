@@ -4,7 +4,7 @@ Oct 15, 2026 · @meteorzhong
 
 ## 导读
 
-本文展开《知识图谱.html》「Web 与框架」分类中的 5 个节点，并对齐《Java开发工程师核心知识点.md》第五章。标注沿用图谱：**【核心】** 面试必问；**【重点】** 常被追问；**【了解】** 知道概念即可。默认版本为 Spring 6 / Spring Boot 3（要求 JDK 17，`javax.*` 迁移到 `jakarta.*`）。Spring Cloud 相关内容放在后续的分布式文档中。
+本文展开《知识图谱.html》「Web 与框架」分类中的 6 个节点（含 Spring Security），并对齐《Java开发工程师核心知识点.md》第五章与第十五章的认证授权部分。标注沿用图谱：**【核心】** 面试必问；**【重点】** 常被追问；**【了解】** 知道概念即可。默认版本为 Spring 6 / Spring Boot 3（要求 JDK 17，`javax.*` 迁移到 `jakarta.*`）。Spring Cloud 相关内容放在后续的分布式文档中，Netty 见《Netty 核心知识点学习文档.md》。
 
 | 图谱节点 | 级别 | 本文章节 |
 | --- | --- | --- |
@@ -13,8 +13,9 @@ Oct 15, 2026 · @meteorzhong
 | Spring Boot（spring-boot） | 核心 | Spring Boot |
 | MyBatis / MyBatis-Plus（mybatis） | 核心 | MyBatis |
 | Spring MVC（spring-mvc） | 重点 | Spring MVC |
+| Spring Security（spring-security） | 重点 | Spring Security 与认证授权 |
 
-**复习顺序**：IOC → Bean 生命周期 → 循环依赖 → AOP → 事务 → MVC → Boot → MyBatis。一条主线串起来：容器创建 Bean，在生命周期的后置处理阶段生成 AOP 代理，事务就是一种 AOP，Boot 的自动配置又往容器里注册了大量 Bean。面试最常见的三道题是：Bean 生命周期、三级缓存、事务失效。
+**复习顺序**：IOC → Bean 生命周期 → 循环依赖 → AOP → 事务 → MVC → Boot → MyBatis → Security。一条主线串起来：容器创建 Bean，在生命周期的后置处理阶段生成 AOP 代理，事务就是一种 AOP，Boot 的自动配置又往容器里注册了大量 Bean；Security 则是守在 Servlet 入口的一组过滤器。面试最常见的四道题是：Bean 生命周期、三级缓存、事务失效、Security 过滤器链。
 
 ## 一、IOC 容器
 
@@ -88,6 +89,8 @@ Bean 的生命周期可以压缩成四步：**实例化 → 属性填充 → 初
 **单例 Bean 是线程安全的吗**：Spring 不保证。大多数 Service、Controller 是**无状态**的（只有注入的依赖，没有可变的成员变量），所以是安全的。如果有可变成员变量，应改为局部变量、使用 ThreadLocal 或并发容器，而不是简单地改成 prototype。
 
 **单例中注入 prototype 的坑**：单例只创建一次，注入进来的 prototype 也就只有一个。需要每次新实例时用 `ObjectProvider<T>.getObject()` 或 `@Lookup`。
+
+**懒加载与依赖顺序【了解】**：`@Lazy` 加在 Bean 上表示第一次 getBean 时才创建；加在注入点上则注入一个代理，调用时才去容器取真实对象，常用来打破构造器注入的循环依赖。`@DependsOn` 不注入依赖，只保证被依赖的 Bean 先初始化，适合「两者没有引用关系、但有启动顺序要求」的场景（如缓存预热 Bean 必须先于业务 Bean）。
 
 ### 2.3 循环依赖与三级缓存【核心】
 
@@ -205,6 +208,8 @@ public class LogAspect {
 
 因为事务连接绑在 ThreadLocal 上，**在事务方法内开新线程操作数据库，不在同一个事务里**。
 
+**隔离级别属性**：`@Transactional(isolation = ...)` 只在**开启新事务**时生效；如果当前已有事务（加入外层），隔离级别由外层决定，内层的设置被忽略。实际隔离级别还取决于数据库：MySQL InnoDB 默认 RR，Oracle 默认 RC。
+
 ### 4.2 七种传播行为【核心】
 
 | 传播行为 | 当前有事务 | 当前无事务 |
@@ -265,6 +270,8 @@ Spring MVC 的核心是前端控制器 `DispatcherServlet`：所有请求先到�
 6. 执行拦截器的 `postHandle()`。
 7. 处理返回值：`@ResponseBody` / `@RestController` 由 HttpMessageConverter 直接写成 JSON；否则返回 ModelAndView，由 **ViewResolver** 解析视图并渲染。
 8. 执行拦截器的 `afterCompletion()`（无论是否异常都会执行，适合清理 ThreadLocal）。
+
+第 7 步由一组 **HandlerMethodReturnValueHandler** 完成：`@ResponseBody` 走 `RequestResponseBodyMethodProcessor`（内部遍历 `HttpMessageConverter`，按 `Content-Type` 和返回类型选择 Jackson 等转换器），返回字符串视图名走 `ViewNameMethodReturnValueHandler`。请求方向的 `@RequestBody` 也由参数解析器 `RequestResponseBodyMethodProcessor` 借助同一套 HttpMessageConverter 完成。
 
 中间任何一步抛出异常，由 `HandlerExceptionResolver` 处理，`@ControllerAdvice` + `@ExceptionHandler` 的全局异常处理就是在这里生效。
 
@@ -330,6 +337,8 @@ Starter 是一组依赖的集合加上对应的自动配置。自定义步骤：
 5. **刷新上下文**：调用 Spring 的 `refresh()`（见 1.3 节），其中 `onRefresh()` 创建并启动内嵌 Tomcat。
 6. 调用 `ApplicationRunner` 和 `CommandLineRunner`，适合做启动后的预热工作。
 
+**内嵌 Tomcat 是怎么起来的【了解】**：`ServletWebServerApplicationContext` 在 `onRefresh()` 中通过 `ServletWebServerFactory`（Servlet 容器默认 `TomcatServletWebServerFactory`）创建 Tomcat 实例，把 `DispatcherServlet` 注册为一个 Servlet 并映射到 `/`；到 `finishRefresh()` 阶段由 `WebServerStartStopLifecycle` 调用 `start()` 开始监听端口。这也是 `java -jar` 无需外部容器的原因；换成 Jetty 或 Undertow 只需要换掉对应的 `ServletWebServerFactory` 实现（由 classpath 决定）。
+
 ### 6.5 配置加载优先级【重点】
 
 从高到低（高优先级覆盖低优先级）：命令行参数 > Java 系统属性（`-D`）> 操作系统环境变量 > jar 包外的 `application-{profile}.yml` > jar 包外的 `application.yml` > jar 包内的 `application-{profile}.yml` > jar 包内的 `application.yml` > `@PropertySource` > 默认值。规律是：外部优先于内部，同一位置带 profile 的优先于不带的（Spring Boot 2.4 起的规则）。
@@ -385,7 +394,22 @@ MyBatis 允许用 `Interceptor` 拦截四大对象：**Executor、StatementHandl
 
 **逻辑分页与物理分页**：MyBatis 自带的 `RowBounds` 是逻辑分页（查出全部再在内存中截取），数据量大时会 OOM；PageHelper 和 MyBatis-Plus 分页插件都是物理分页。
 
-### 7.6 动态 SQL 与 MyBatis-Plus【重点】
+### 7.6 resultMap 与关联查询【重点】
+
+`resultType` 让 MyBatis 按「列名 = 属性名」自动映射（开启 `mapUnderscoreToCamelCase` 后会自动把 `create_time` 映射到 `createTime`）；`resultMap` 则显式描述映射关系，可以指定 `javaType`、`jdbcType`、`typeHandler`，处理列名与属性名不一致、枚举与自定义类型转换、构造器注入等 `resultType` 无法覆盖的情况。
+
+**关联映射的两种写法**：
+
+| 写法 | XML 结构 | 特点 |
+| --- | --- | --- |
+| 嵌套结果 | 一条 JOIN SQL + `<association>` / `<collection>` 描述对象关系 | 一次查询完成，无 N+1，**推荐** |
+| 嵌套查询 | `<association select="...">` / `<collection select="...">` 再发一条 SQL | SQL 简单、可复用，但默认立即加载时会产生 N+1；需配 `fetchType="lazy"` 和 `lazyLoadingEnabled` |
+
+- `<association property="user" javaType="User">` 映射单个对象，`<collection property="items" ofType="OrderItem">` 映射集合，`ofType` 是集合元素类型。
+- `<id>` 标签标记主键列，MyBatis 靠它判断多行是否属于同一个外层对象并合并结果，一对多映射必须写，否则会得到重复的父对象。
+- **一对多分页的坑**：JOIN 之后行数被放大，PageHelper 按行做 count 和 LIMIT，导致「每页条数变少、总数变大」。正确做法是先分页查主表，再用主键集合批量查子表，在应用层组装。
+
+### 7.7 动态 SQL 与 MyBatis-Plus【重点】
 
 - **动态 SQL 标签**：`<if>`、`<choose>/<when>/<otherwise>`、`<where>`（自动去掉多余的 AND）、`<set>`、`<foreach>`（IN 查询、批量插入）、`<trim>`。
 - **MyBatis-Plus**：在 MyBatis 基础上提供通用 CRUD（`BaseMapper`、`IService`）、条件构造器（`LambdaQueryWrapper`，用方法引用避免字段名写错）、分页插件、逻辑删除（`@TableLogic`）、乐观锁插件（`@Version`）、自动填充创建时间等。
@@ -425,11 +449,107 @@ MyBatis 允许用 `Interceptor` 拦截四大对象：**Executor、StatementHandl
 - `@Async` 同样基于代理，自调用失效；**务必指定自定义线程池**。Spring Boot 2.1 起默认使用自动配置的 `ThreadPoolTaskExecutor`（核心线程 8、无界队列），高并发下队列会无限堆积。
 - `@Scheduled` 默认是单线程执行所有定时任务，一个任务卡住会影响其他任务，需要配置 `spring.task.scheduling.pool.size`。多实例部署时会重复执行，需要分布式锁（如 ShedLock）或改用 XXL-JOB 等调度平台。
 
-## 九、高频面试题与自测清单
+## 九、Spring Security 与认证授权
 
-下面 18 道题覆盖图谱中全部「核心」知识点。Spring 题目的加分方式是能说出关键类名和方法名（如 `refresh`、`singletonFactories`、`TransactionInterceptor`），说明看过源码。
+Spring Security 的本质是一组 Servlet Filter：认证、授权、CSRF、异常处理都做成过滤器，串在业务 Servlet 之前，对业务代码零侵入。认证解决「你是谁」，授权解决「你能做什么」。
 
-### 9.1 高频面试题
+### 9.1 过滤器链与核心组件【重点】
+
+| 组件 | 作用 |
+| --- | --- |
+| `DelegatingFilterProxy` | Servlet 容器里的入口过滤器，把调用委托给 Spring 容器中的 `springSecurityFilterChain` |
+| `FilterChainProxy` | 真正的过滤器链管理者，内部持有多个 `SecurityFilterChain` |
+| `SecurityFilterChain` | 一组过滤器 + 匹配规则（`securityMatcher`），按声明顺序匹配第一个命中的链 |
+| `SecurityContext` / `SecurityContextHolder` | 保存当前请求的认证信息，默认基于 ThreadLocal |
+| `GrantedAuthority` | 权限标识，如 `ROLE_ADMIN`、`order:read` |
+
+**为什么要多条链**：可以按 URL 前缀配置不同策略，例如 `/api/**` 用 JWT 无状态链、`/admin/**` 用表单登录链、`/public/**` 直接放行。
+
+**过滤器典型顺序**（从外到内）：`DisableEncodeUrlFilter` → `WebAsyncManagerIntegrationFilter` → `SecurityContextHolderFilter` → `HeaderWriterFilter` → `CorsFilter` → `CsrfFilter` → `LogoutFilter` → 认证过滤器（`UsernamePasswordAuthenticationFilter` / `BearerTokenAuthenticationFilter`）→ `BasicAuthenticationFilter` → `RequestCacheAwareFilter` → `SecurityContextHolderAwareRequestFilter` → `AnonymousAuthenticationFilter` → `ExceptionTranslationFilter` → `AuthorizationFilter`。
+
+必须记住两点：`ExceptionTranslationFilter` 一定在 `AuthorizationFilter` **之前**，否则捕获不到授权异常；`AnonymousAuthenticationFilter` 在授权前放入匿名身份，保证 `AuthorizationFilter` 拿到的 `Authentication` 不为 null。
+
+Spring Security 5.7 起 `WebSecurityConfigurerAdapter` 被移除，改为声明 `SecurityFilterChain` Bean；`authorizeRequests` 改名 `authorizeHttpRequests`，`antMatchers` 改名 `requestMatchers`。
+
+### 9.2 认证流程【核心】
+
+以用户名密码登录为例：
+
+1. `UsernamePasswordAuthenticationFilter` 拦截 `POST /login`，封装成**未认证**的 `UsernamePasswordAuthenticationToken`。
+2. 交给 `AuthenticationManager`（默认实现 `ProviderManager`）。
+3. `ProviderManager` 按 `supports` 找到 `DaoAuthenticationProvider`。
+4. 它调用 `UserDetailsService.loadUserByUsername()` 拿到 `UserDetails`（用户名、密码哈希、权限）。
+5. `PasswordEncoder.matches(raw, encoded)` 比对密码。
+6. 通过后构造**已认证**的 Token（携带 `GrantedAuthority`），执行 `eraseCredentials()` 清除密码。
+7. 放入 `SecurityContextHolder`，并保存到 `SecurityContextRepository`（默认 HttpSession）。
+8. 失败则抛 `AuthenticationException`，由 `ExceptionTranslationFilter` 统一返回 401 或跳转登录。
+
+`Authentication` 同时承载 principal（我是谁）、credentials（凭证）、authorities（权限）。业务代码通过 `SecurityContextHolder.getContext().getAuthentication()` 获取当前用户。扩展点：自定义用户来源实现 `UserDetailsService`；短信验证码、扫码等登录方式实现 `AuthenticationProvider` 或自定义 Filter，认证成功后手动写入 `SecurityContext`。
+
+### 9.3 JWT 无状态认证与续期【重点】
+
+**结构**：`Header.Payload.Signature`。Payload 放 `sub`、`exp`、`iat`、`jti` 与权限；Signature 用密钥（HS256）或私钥（RS256）签名。
+
+**接入方式**：自定义 `OncePerRequestFilter`，放在 `UsernamePasswordAuthenticationFilter` 之前，从 `Authorization: Bearer <token>` 取 Token → 校验签名与 `exp` → 构造已认证的 Token 放入 `SecurityContextHolder` → 继续 `chain.doFilter()`。配合 `SessionCreationPolicy.STATELESS`，服务端不创建 Session。
+
+| 续期方案 | 做法 | 代价 |
+| --- | --- | --- |
+| 双 Token | accessToken 短（15\~30 分钟）+ refreshToken 长（7\~30 天），过期后用 refresh 换新 | 需要刷新接口与 refresh 存储 |
+| 滑动续期 | 剩余有效期不足阈值时签发新 Token | 频繁签发，旧 Token 仍有效到过期 |
+| Redis 会话 | Token 只作凭证，服务端存过期时间并滑动刷新 | 退化为有状态，但可精确控制注销 |
+
+**注销**：JWT 签发后无法主动作废。常用 `jti` 黑名单（TTL 等于剩余有效期），或在 Payload 放用户版本号，改密码 / 强制下线时递增版本号。
+
+**风险**：校验时必须显式指定算法，不信任 Header 中的 `alg`（防算法混淆与 `none`）；密钥不能硬编码；Payload 可被 Base64 解码，不放敏感信息。
+
+### 9.4 OAuth2 授权码模式与 SSO【重点】
+
+OAuth2 解决「第三方应用如何在不拿用户密码的前提下访问用户资源」。授权码模式最安全：
+
+1. 浏览器重定向到授权服务器：`/authorize?response_type=code&client_id=...&redirect_uri=...&scope=...&state=...`（公共客户端再加 PKCE 的 `code_challenge`）。
+2. 用户在授权服务器登录并授权。
+3. 重定向回 `redirect_uri?code=xxx&state=xxx`。
+4. 客户端**后端**用 `code + client_secret` 调 `/token` 换取 `access_token`、`refresh_token`（OIDC 还有 `id_token`）。
+5. 用 access_token 调资源服务器。
+
+**为什么不用隐式模式**：Token 会出现在浏览器历史、Referer 和日志中；授权码只能被后端用 `client_secret` 兑换一次，暴露风险最小。PKCE 解决 App / SPA 这类公共客户端无法保存 `client_secret` 的问题。`state` 用于防 CSRF，回调时必须比对。
+
+**SSO**：同域 Cookie 共享、CAS、以 OAuth2 / OIDC 授权服务器为统一认证中心，或在网关统一鉴权后把用户信息注入内部请求头（内部网络需隔离）。
+
+### 9.5 授权：URL、方法级与越权【重点】
+
+```java
+@Bean
+SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+    http.authorizeHttpRequests(auth -> auth
+            .requestMatchers("/login", "/public/**").permitAll()
+            .requestMatchers("/admin/**").hasRole("ADMIN")
+            .requestMatchers(HttpMethod.POST, "/orders/**").hasAuthority("order:write")
+            .anyRequest().denyAll())
+        .csrf(csrf -> csrf.disable());
+    return http.build();
+}
+```
+
+- 规则**从上到下**匹配，第一个命中生效，`anyRequest()` 放最后；`denyAll()` 兜底比默认放行安全。
+- `hasRole("ADMIN")` 等价于 `hasAuthority("ROLE_ADMIN")`，会自动加 `ROLE_` 前缀。
+- 方法级：`@EnableMethodSecurity` + `@PreAuthorize("hasRole('ADMIN') or #userId == authentication.principal.id")`，还有 `@PostAuthorize`（检查返回值）、`@PreFilter` / `@PostFilter`（过滤集合）。它基于 AOP，**同类自调用会失效**，与 `@Transactional` 同一个坑。
+- 权限模型用 RBAC，库里存权限码（`order:read`）而不是硬编码角色。
+
+**越权**：URL / 方法级授权判断不了「这条数据是不是你的」。按 ID 查询或修改的接口必须校验 `owner_id = 当前用户`，复杂场景用 MyBatis 拦截器自动拼数据权限条件；导出、下载同样要做归属校验，且 ID 不要可枚举。
+
+### 9.6 密码、会话与 CSRF【了解】
+
+- **BCrypt**：自带随机盐、慢哈希，`strength` 默认 10；同一明文每次结果不同，校验用 `matches()`。Spring Security 5 起默认 `DelegatingPasswordEncoder`，密文带 `{bcrypt}` 前缀，便于平滑迁移算法。禁止 MD5、SHA-1、明文和固定盐。
+- **并发登录**：`sessionManagement(s -> s.maximumSessions(1).maxSessionsPreventsLogin(true))` 配合 `SessionRegistry`；集群用 Spring Session + Redis。登录后更换 Session ID（`migrateSession`）可防 Session 固定攻击。
+- **CSRF**：浏览器自动携带 Cookie，攻击者在别的站点构造请求冒充用户。防护用 CSRF Token（默认对非 GET 校验）、`SameSite` Cookie、校验 `Origin`。前后端分离时用 `CookieCsrfTokenRepository.withHttpOnlyFalse()` 让前端读取 `XSRF-TOKEN`；若 Token 放在 `Authorization` 头（浏览器不会自动附带），可以安全关闭 CSRF。
+- **其他攻击**：SQL 注入用 `#{}` / PreparedStatement；XSS 用输出转义、CSP、`HttpOnly`；SSRF 校验目标地址、禁止内网网段；重放攻击用 `sign(timestamp + nonce + params + secret)` 并对 nonce 做 Redis 去重。
+
+## 十、高频面试题与自测清单
+
+下面 24 道题覆盖图谱中全部「核心」知识点。Spring 题目的加分方式是能说出关键类名和方法名（如 `refresh`、`singletonFactories`、`TransactionInterceptor`），说明看过源码。
+
+### 10.1 高频面试题
 
 | # | 题目 | 答案要点 | 章节 |
 | --- | --- | --- | --- |
@@ -451,8 +571,14 @@ MyBatis 允许用 `Interceptor` 拦截四大对象：**Executor、StatementHandl
 | 16 | 拦截器和过滤器的区别？ | 规范、位置、范围、能拿到的信息 | 五 |
 | 17 | Spring Boot 自动配置原理？怎么写一个 Starter？ | AutoConfiguration.imports + @Conditional；五步 | 六 |
 | 18 | MyBatis #{} 和 ${} 的区别？Mapper 接口怎么工作？缓存有什么坑？ | 预编译 vs 拼接；JDK 代理；一级缓存在 Spring 中的生效范围、二级缓存脏数据 | 七 |
+| 19 | resultMap 和 resultType 有什么区别？关联查询怎么配？ | 显式映射 / typeHandler；嵌套结果 vs 嵌套查询与 N+1；`<id>` 合并、一对多分页坑 | 七 |
+| 20 | Spring Security 过滤器链怎么工作？关键过滤器顺序？ | DelegatingFilterProxy → FilterChainProxy → SecurityFilterChain；ExceptionTranslationFilter 在 AuthorizationFilter 前 | 九 |
+| 21 | 用户名密码的认证流程？ | 认证过滤器 → ProviderManager → DaoAuthenticationProvider → UserDetailsService → PasswordEncoder → SecurityContext | 九 |
+| 22 | JWT 怎么续期和注销？ | 双 Token / 滑动续期 / Redis；jti 黑名单、用户版本号；指定算法防 alg 混淆 | 九 |
+| 23 | OAuth2 授权码模式流程？为什么不用隐式模式？ | 跳转授权 → 回调带 code → 后端用 code + secret 换 token；隐式模式 Token 暴露在浏览器 | 九 |
+| 24 | 水平越权和 CSRF 怎么防？ | 校验 owner / 数据权限拦截器；CSRF Token、SameSite，JWT 放 Header 时可关闭 | 九 |
 
-### 9.2 动手实验
+### 10.2 动手实验
 
 - [ ] 写一个实现了所有生命周期接口的 Bean，在每个回调中打印日志，验证顺序
 - [ ] 构造 A、B 字段注入的循环依赖，在 `DefaultSingletonBeanRegistry.getSingleton` 打断点观察三级缓存变化；再改成构造器注入看报错
@@ -460,8 +586,10 @@ MyBatis 允许用 `Interceptor` 拦截四大对象：**Executor、StatementHandl
 - [ ] 写一个自定义 Starter（如统一的操作日志或接口限流），引入后无需任何配置即生效
 - [ ] 写一个 MyBatis 插件，打印每条 SQL 的执行耗时
 - [ ] 用 `--debug` 启动一个 Boot 应用，读懂自动配置的条件评估报告
+- [ ] 开启 `logging.level.org.springframework.security=DEBUG`，登录一次，观察 Security 过滤器链的执行日志
+- [ ] 用 `OncePerRequestFilter` 实现 JWT 认证，验证无 Token / 过期 Token 分别返回 401
 
-### 9.3 自测清单
+### 10.3 自测清单
 
 - [ ] 能把「容器启动 → Bean 生命周期 → AOP 代理 → 事务」串成一条线讲清楚
 - [ ] 能画出三级缓存解决循环依赖的流程，并说清为什么需要第三级
@@ -469,3 +597,5 @@ MyBatis 允许用 `Interceptor` 拦截四大对象：**Executor、StatementHandl
 - [ ] 能解释自动配置为什么「用户自己定义的 Bean 优先」
 - [ ] 能说清 PageHelper 的原理以及为什么 startPage 必须紧跟查询
 - [ ] 能列出 Spring 中用到的 6 种以上设计模式及对应的类
+- [ ] 能按顺序说出 Security 过滤器链中认证、授权、异常处理三个关键过滤器及其相对位置
+- [ ] 能讲完认证 8 步流程，并解释 JWT 为什么无法主动注销及两种解决方案
