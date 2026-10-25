@@ -12,7 +12,7 @@ Oct 14, 2026 · @meteorzhong
 | 索引与 B+ 树（index） | 核心 | 索引、SQL 基础与优化 |
 | 事务与 MVCC（transaction） | 核心 | 事务、锁 |
 | 分库分表（sharding） | 重点 | 高可用与扩展 |
-| 连接池（connection-pool） | 重点 | 表设计与规范 · 连接池 |
+| 连接池（connection-pool）、Druid | 重点 | 表设计与规范 · 连接池（HikariCP / Druid） |
 
 **复习顺序**：架构 → 索引 → 事务与 MVCC → 锁 → 日志 → SQL 基础与优化 → Buffer Pool → 主从与分库分表。索引、MVCC、三大日志是面试出现频率最高的三块，建议优先吃透。
 
@@ -592,13 +592,55 @@ SQL 偶发变慢、抖动，常见原因就是前两种情况触发了集中刷�
 - **作用**：复用 TCP 连接，省掉握手和认证开销，并限制对数据库的最大连接数。Spring Boot 2.0 起默认 HikariCP。
 - **核心参数（HikariCP）**：`maximumPoolSize`、`minimumIdle`、`connectionTimeout`（取连接超时，默认 30 秒）、`maxLifetime`（应小于 MySQL 的 `wait_timeout`）、`leakDetectionThreshold`（连接泄漏检测）。
 - **池大小**：不是越大越好。HikariCP 官方建议的起点公式是 `连接数 = CPU 核数 × 2 + 有效磁盘数`。还要保证「应用实例数 × 每实例池大小 < MySQL `max_connections`」。
-- **Druid**：特点是自带监控页面、SQL 统计和 SQL 防火墙，在国内项目中常见。
 - **HikariCP 为什么快【了解】**：① 自研 `ConcurrentBag` 管理连接，ThreadLocal 缓存 + CAS 借还，避开了 C3P0、Druid 基于锁的连接管理；② 自研 `FastList` 替代 ArrayList，去掉下标范围检查；③ 用 Javassist 生成精简字节码做代理，方法调用层级少、体积小。差距在高并发短操作时最明显，普通场景几个主流连接池差异不大。
 - **连接泄漏定位【重点】**：连接被借出后未归还（手动 `getConnection` 后漏了 close、异常路径绕过关闭逻辑），池耗尽后所有请求卡在取连接上。排查手段：HikariCP 设置 `leakDetectionThreshold`（如 30000 ms），连接借出超过该时间未归还就打印借出点的堆栈，按堆栈即可定位到未关闭的代码。注意该检测有开销，建议测试环境常开、生产环境排查时临时开启；同时可配合 `SHOW PROCESSLIST` 看大量 Sleep 连接佐证。
 
+### 9.6 Druid【重点】
+
+Druid 是阿里开源的连接池，除了池化本身，它的差异化能力在**监控、SQL 统计与防护**，因此国内项目（尤其是需要看 SQL 执行情况的团队）大量使用。
+
+**核心参数**：
+
+| 参数 | 含义 | 建议 |
+| --- | --- | --- |
+| `initialSize` | 初始化时建立的连接数 | 与 `minIdle` 一致，避免启动后突增 |
+| `minIdle` / `maxActive` | 最小空闲 / 最大连接数 | 按「CPU × 2 + 磁盘数」估算，别超过 MySQL `max_connections` |
+| `maxWait` | 取连接的最长等待（毫秒） | 必须显式设置，否则会一直等 |
+| `validationQuery` | 检测连接是否可用的 SQL | MySQL 用 `SELECT 1` |
+| `testWhileIdle` / `testOnBorrow` / `testOnReturn` | 何时校验连接 | 推荐 `testWhileIdle=true`，配合 `timeBetweenEvictionRunsMillis` |
+| `keepAlive` | 保活，防止连接被中间件或 MySQL 断开 | 开启，并让它小于 `wait_timeout` |
+| `phyTimeoutMillis` | 连接的物理最大存活时间 | 解决 `maxLifetime` 类问题 |
+| `removeAbandoned` | 强制回收借出过久的连接 | 只在排障时开，正常不应依赖 |
+
+**PSCache（PreparedStatement 缓存）**：`poolPreparedStatements=true` 时按连接缓存 PreparedStatement，减少重复解析。MySQL 下收益有限，而且开启 `serverPrepStmts=true` 后才真正走服务端预编译；很多团队直接用 JDBC 的 `cachePrepStmts`。开启后要注意游标（`useCursorFetch`）场景下 PSCache 可能不生效。
+
+**内置 Filter（`filters` 配置）**：
+
+| Filter | 作用 | 说明 |
+| --- | --- | --- |
+| `stat` | 统计每条 SQL 的执行次数、耗时、慢 SQL | 监控页面的数据来源 |
+| `wall` | SQL 防火墙，拦截无 where 的 update/delete、多语句、注释注入 | 防误操作与注入的兜底，**不能替代参数化查询** |
+| `slf4j` / `log4j2` | 输出 SQL 日志 | 与日志框架集成 |
+| `config` | 支持加密后的数据库密码 | 配 `ConfigFilter` + 公钥解密 |
+
+**监控**：配置 `StatViewServlet`（`/druid/*`，生产必须加登录与 IP 白名单）和 `WebStatFilter`，可看到数据源状态、SQL 执行排行、慢 SQL、URI 监控。监控数据放在内存的环形数组中，长期运行要关注内存占用，必要时调小 `maxStatSqlCount`。
+
+**密码加密**：用 `ConfigTools.encrypt()` 生成密文与公钥，配置 `config.decrypt=true`，避免明文密码进 Git。
+
+**Druid 与 HikariCP 对比**：
+
+| 维度 | Druid | HikariCP |
+| --- | --- | --- |
+| 性能 | 好，但锁竞争路径比 Hikari 多 | 更极致，高并发短连接场景更快 |
+| 监控与统计 | 内置页面、SQL 统计、慢 SQL、防火墙 | 基本没有，需外部埋点 |
+| 生态 | 国内文档多，Spring Boot Starter 成熟 | Spring Boot 默认，轻量 |
+| 选型 | 需要 SQL 监控、审计、防火墙时 | 追求吞吐、无额外运维需求时 |
+
+**排障要点**：连接数打满时先看 `maxActive` 与实际活跃连接、`maxWait` 超时日志；`removeAbandoned` 报出的堆栈是定位泄漏的直接证据；SQL 变慢看监控里的慢 SQL 排行，再用 EXPLAIN 分析；`wall` 误拦截（如误判正常 SQL）要单独放行，别直接关掉。
+
 ## 十、高频面试题与自测清单
 
-下面 20 道题覆盖图谱中全部「核心」知识点，答案要点对应前文章节。答题时先说结论，再讲原理，最后补一个实际场景或踩坑经历。
+下面 22 道题覆盖图谱中全部「核心」知识点，答案要点对应前文章节。答题时先说结论，再讲原理，最后补一个实际场景或踩坑经历。
 
 ### 10.1 高频面试题
 
@@ -624,6 +666,8 @@ SQL 偶发变慢、抖动，常见原因就是前两种情况触发了集中刷�
 | 18 | 深分页怎么优化？ | 延迟关联、游标分页、限制页数、ES | 六 |
 | 19 | 主从复制原理与延迟怎么处理？ | binlog dump / I/O / SQL 三线程；大事务、并行复制、强制读主 | 八 |
 | 20 | 什么时候分库分表？带来哪些问题？ | 数据量 / 写入瓶颈；全局 ID、跨库查询、分布式事务、扩容 | 八 |
+| 21 | Druid 有哪些核心参数？怎么开监控和 SQL 防火墙？ | initialSize/maxActive/maxWait/keepAlive；StatViewServlet + stat、wall filter | 九 |
+| 22 | 连接池被耗尽怎么排查？ | 看活跃数与 maxWait 超时；leakDetectionThreshold / removeAbandoned 抓借出堆栈 | 九 |
 
 **加分题**：为什么推荐自增主键？Change Buffer 为什么只用于非唯一索引？InnoDB 的 LRU 做了哪些改进？count(\*) 为什么慢？为什么很多公司把隔离级别改为 RC？HikariCP 为什么比其他连接池快？分区表能替代分库分表吗？「每组取 Top N」用窗口函数怎么写？
 
@@ -636,6 +680,8 @@ SQL 偶发变慢、抖动，常见原因就是前两种情况触发了集中刷�
 - [ ] 对同一条 SQL 分别设计「会回表」和「覆盖索引」两种索引，对比 EXPLAIN
 - [ ] 造 100 万行数据，对比 `LIMIT 900000, 10` 与延迟关联、游标分页的耗时
 - [ ] 用 Docker 搭一主一从，开启 GTID，在主库执行大事务并观察从库延迟
+- [ ] 配一个 Druid 数据源，打开 StatViewServlet，观察慢 SQL 排行与 URI 监控
+- [ ] 故意不归还连接，用 `removeAbandoned` 或 `leakDetectionThreshold` 打印出泄漏堆栈
 
 ### 10.3 自测清单
 

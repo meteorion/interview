@@ -12,7 +12,7 @@ Oct 15, 2026 · @meteorzhong
 | 集合框架（collections） | 核心 | 集合框架与 List、HashMap |
 | 泛型与注解（generics） | 重点 | 泛型、注解与函数式 |
 | 函数式编程（functional） | 重点 | 泛型、注解与函数式 |
-| IO / NIO / AIO（io-nio） | 重点 | IO / NIO |
+| IO / NIO / AIO（io-nio） | 重点 | 五、IO / NIO（Buffer、Channel、Selector、文件 NIO.2、异步通道） |
 | 现代 Java 特性（new-features） | 了解 | 现代 Java 特性 |
 
 **复习顺序**：String 与 equals / hashCode → HashMap → ArrayList → 其余。这部分题目看起来基础，但常被用来「热身」和考察源码功底，尤其是 HashMap，要能讲到字段和方法级别。ConcurrentHashMap 见并发文档第七章。
@@ -326,7 +326,116 @@ IO 模型是理解 Netty、Redis、Kafka 等高性能组件的基础；现代 Ja
 | NIO（同步非阻塞 + I/O 多路复用） | Selector 一个线程监听多个 Channel，哪个就绪处理哪个 | 少量线程处理大量连接 | 高并发网络服务，Netty 的基础 |
 | AIO（异步非阻塞） | 发起读写后立即返回，完成后回调 | 系统完成 I/O 后通知 | Linux 上底层仍是 epoll 模拟，实际使用少 |
 
-**NIO 三大组件【重点】**：**Channel**（双向通道）、**Buffer**（数据必须经过缓冲区，读写切换要调用 `flip()`）、**Selector**（多路复用器）。
+**先分清两组概念**：阻塞 / 非阻塞说的是「调用后线程是否被挂起」；同步 / 异步说的是「数据从内核到用户缓冲区这一步由谁完成」。NIO 是同步非阻塞——`read` 立即返回 0，但内核数据就绪后仍要用户线程自己调 `read` 把数据拷进 `ByteBuffer`；AIO 才是真正的异步，内核把数据拷完再回调。所以「NIO 是非阻塞的，但仍属于同步 I/O」。
+
+`SocketChannel.configureBlocking(false)` 才是 NIO 非阻塞模式的开关，默认仍是阻塞的。
+
+### 5.2 Buffer：NIO 的数据载体【核心】
+
+**Channel 只认 ByteBuffer**，其他类型的 Buffer 只用于内存内数据加工。
+
+| 类型 | 说明 |
+| --- | --- |
+| `ByteBuffer` | 唯一能与 Channel 直接交互的缓冲；支持 `allocateDirect` |
+| `CharBuffer` / `ShortBuffer` / `IntBuffer` / `LongBuffer` / `FloatBuffer` / `DoubleBuffer` | 按基本类型读写，常用于编解码、结构化数据拼装 |
+| `MappedByteBuffer` | `FileChannel.map` 返回，把文件区域映射为堆外内存 |
+
+**四个核心属性**：`capacity`（容量，创建后不变）、`limit`（可读写上限）、`position`（下一个读写位置）、`mark`（临时记录点）。不变式：`0 <= mark <= position <= limit <= capacity`。
+
+| 方法 | 作用 | 典型时机 |
+| --- | --- | --- |
+| `flip()` | `limit = position; position = 0`，从「写模式」切到「读模式」 | 写完数据准备读 / 发给 Channel 前 |
+| `clear()` | `position = 0; limit = capacity`，丢弃未读数据 | 一次读写完成后复用缓冲区 |
+| `rewind()` | `position = 0`，保留 limit，可重读一遍 | 需要重复读取同一段数据 |
+| `compact()` | 把未读数据移到开头，`position = 剩余长度`，`limit = capacity` | **读了一半就要继续写**（如 HTTP 响应还没写完又来数据） |
+| `mark()` / `reset()` | 记住 / 回到 mark 位置 | 解析报文时试探性读取 |
+
+`slice()` 以当前 position 到 limit 为范围创建一个新 Buffer，与 `duplicate()` 一样**共享底层数组**，只复制索引，属于零拷贝手段；`asReadOnlyBuffer()` 用于防止下游修改数据。
+
+**Scattering Reads / Gathering Writes**：`read(ByteBuffer[])` 按数组顺序把数据依次填满各个 Buffer（如先 8 字节头部、再变长 body）；`write(ByteBuffer[])` 把多个 Buffer 一次写出。两者都是一次系统调用，减少调用次数与数据拷贝。
+
+**直接缓冲区与非直接缓冲区【重点】**：
+
+| 维度 | 堆内 `allocate()` | 堆外 `allocateDirect()` |
+| --- | --- | --- |
+| 分配 / 回收成本 | 低（JVM 管理，GC 回收） | 高（`malloc` + `Cleaner`，随 Full GC 或显式释放） |
+| I/O 拷贝 | 写 Socket 时需先拷到临时直接内存 | 可直接交给内核，少一次拷贝 |
+| 适用 | 短生命周期、频繁创建 | 长连接、网络读写、大文件 |
+
+**非直接缓冲（以及直接缓冲）的回收延迟处理**：`allocateDirect` 的回收依赖 `Cleaner`（`sun.misc.Unsafe.invokeCleaner` 或反射调 `clean`，JDK 9+ 推荐 `Unsafe`），只调 `System.gc()` 不可靠且代价高。工程上的正确做法是**复用**：用池化（Netty 的 `PooledByteBufAllocator`）或自己维护 Buffer 池，并把 `-XX:MaxDirectMemorySize` 设为可控上限，监控堆外内存。
+
+**大文件高效读写**：`FileChannel` + 固定大小 `ByteBuffer` 循环读写（配合 `transferTo` 直接通道间传输），或 `MappedByteBuffer` 做随机访问；避免一次 `Files.readAllBytes` 把整个文件读进堆。
+
+### 5.3 Channel 与文件 NIO.2【重点】
+
+| 维度 | Stream | Channel |
+| --- | --- | --- |
+| 方向 | 单向（输入流 / 输出流） | **双向**，同一通道可读可写 |
+| 阻塞 | 只能阻塞 | 可阻塞也可非阻塞（`configureBlocking(false)`） |
+| 与 Buffer | 直接读写字节 / 字符 | 必须经过 Buffer |
+| 复用与异步 | 不支持 | 支持多路复用，NIO.2 支持异步 |
+
+**四种主要 Channel**：`FileChannel`（文件）、`SocketChannel`（TCP 客户端）、`ServerSocketChannel`（TCP 服务端，只处理 `OP_ACCEPT`）、`DatagramChannel`（UDP）。Channel 与 Buffer 的关系是「通道负责搬运，缓冲区负责存放」，一次读写总是成对出现。
+
+`FileChannel` 的核心能力：`read/write`、`position/size/truncate`、`force`（刷盘）、`transferTo/transferFrom`（通道间直接传输，底层可走 sendfile）、`map`（映射文件）、`lock`（文件锁）。
+
+**`MappedByteBuffer`**：用 `mmap` 把文件映射到进程虚拟地址空间，读写像操作数组，适合大文件随机读写与索引文件（如 Kafka 的索引、RocketMQ 的 CommitLog 写）。注意：映射内存不在堆内、回收时机不确定，文件被映射期间删除 / 截断在 Windows 上会失败，用完最好显式 `unmap`。
+
+**NIO.2 文件 API（`Path` / `Paths` / `Files`）**：`Path` 取代 `File` 表示路径，`Files` 提供 `readAllBytes`、`newBufferedReader`、`lines`、`walk`、`copy`、`move`、`delete`、`createDirectories`、`readAttributes` 等静态方法；`Files.walk` + `try-with-resources` 是遍历目录的标准写法。
+
+**`FileAttributeView`**：批量读写文件属性。常见实现：`BasicFileAttributeView`（大小、时间、类型）、`PosixFileAttributeView`（Linux 权限、owner、group）、`DosFileAttributeView`（隐藏、只读、存档）、`UserDefinedFileAttributeView`（自定义扩展属性，如打标签）。
+
+**`WatchService` 文件监控**：`FileSystems.getDefault().newWatchService()`，目录 `register` 时指定 `ENTRY_CREATE` / `ENTRY_MODIFY` / `ENTRY_DELETE`，`take()` 阻塞获取、`poll()` 非阻塞。Linux 底层是 inotify，macOS 是 FSEvents / kqueue。坑：事件会合并、同一修改可能重复触发、只监控注册的那一层目录；生产上更常用 Filebeat / inotify 封装库。
+
+**`FileLock` 文件锁**：`channel.lock()`（阻塞）/ `tryLock()`（非阻塞）加锁，支持共享锁与排他锁。它是**进程间**锁，不是线程锁——同一 JVM 内对同一文件重复加锁会抛 `OverlappingFileLockException`，线程间互斥要用 `ReentrantLock`。
+
+**`Charset` 编解码**：`Charset.forName("UTF-8")`（或 `StandardCharsets.UTF_8`）→ `newEncoder()/newDecoder()` → `encode(CharBuffer)` 得 `ByteBuffer`、`decode(ByteBuffer)` 得 `CharBuffer`。解码要处理 `MalformedInputException` / `UnmappableCharacterException`，可用 `CodingErrorAction.REPLACE` 容错；网络传输中「半包」导致的半个多字节字符，必须等下一批数据补齐再解码。
+
+**`Pipe` 管道**：单向，一对 `source` / `sink` 两个 Channel，用于**同一 JVM 内线程间**传数据（跨进程用 Socket）。注意 `sink` 写满后会阻塞，读者必须及时消费。
+
+**线程间数据共享的三种方式**：`Pipe`（字节流）、`Exchanger`（成对交换对象）、`BlockingQueue`（最常用）。
+
+### 5.4 Selector 与多路复用【核心】
+
+Selector 让**一个线程管理多个 Channel**：Channel 注册到 Selector 并声明关心的事件，`select()` 阻塞等待，返回后遍历 `selectedKeys()` 处理就绪事件。
+
+```java
+Selector selector = Selector.open();
+serverChannel.configureBlocking(false);
+serverChannel.register(selector, SelectionKey.OP_ACCEPT);
+
+while (true) {
+    selector.select();                       // 阻塞直到有事件就绪
+    Iterator<SelectionKey> it = selector.selectedKeys().iterator();
+    while (it.hasNext()) {
+        SelectionKey key = it.next();
+        it.remove();                         // 必须先移除，否则重复处理
+        if (key.isAcceptable()) { /* accept 新连接并注册 OP_READ */ }
+        else if (key.isReadable()) { /* 读数据，注意 read 返回 -1 表示对端关闭 */ }
+    }
+}
+```
+
+**四种事件**：`OP_ACCEPT`（服务端有新连接）、`OP_CONNECT`（客户端连接完成）、`OP_READ`（可读）、`OP_WRITE`（可写）。**`OP_WRITE` 绝大多数时间都是就绪的**，常驻注册会导致 `select()` 一直空转占满 CPU，正确做法是「写不完时才注册，写完立即取消」。
+
+| 方法 | 行为 |
+| --- | --- |
+| `select()` | 阻塞，直到至少一个事件就绪 |
+| `select(long timeout)` | 最多阻塞 timeout 毫秒，超时返回 0 |
+| `selectNow()` | 不阻塞，立即返回就绪数量 |
+| `wakeup()` | 唤醒阻塞在 `select()` 上的线程（另一个线程退出 / 提交任务时用） |
+
+**`SelectionKey`**：保存 `interestOps`（关心的事件）、`readyOps`（就绪的事件）、`attachment`（可挂业务对象，如会话状态）、对应的 Channel 与 Selector。事件回调里处理完要判断「是否还有兴趣继续」，必要时 `key.cancel()`。
+
+**安全地取消与关闭【重点】**：先 `key.cancel()`，再把 Channel 关闭；被取消的 key 会在下一次 `select()` 时从内部集合清理，**不要在遍历 `selectedKeys()` 的过程中直接 `remove` 以外的结构修改**（用 `Iterator.remove()`）。`channel.close()` 会自动取消该 Channel 的所有 key；关闭后对 key 的操作会抛 `CancelledKeyException`，处理事件前可先 `key.isValid()` 判断。
+
+**Selector 性能优化**：① 不在 Selector 线程里做耗时业务（丢线程池）；② 不常驻注册 `OP_WRITE`；③ 用直接缓冲区，必要时池化；④ 边缘触发下一次读到 `read == 0` 为止；⑤ 合理设置线程数与 `SO_BACKLOG`；⑥ 规避 JDK 空轮询（Netty 通过重建 Selector 解决）。
+
+**SocketChannel / ServerSocketChannel 非阻塞编程**：`accept()` 可能返回 `null`（无新连接），`read()` 返回 0（暂无数据）或 -1（对端关闭）；连接未完成时 `finishConnect()` 返回 false，需注册 `OP_CONNECT` 等下次事件再 finish。
+
+**UDP 通信**：`DatagramChannel.open().bind(port)`，`configureBlocking(false)` 后 `register(selector, OP_READ)`，用 `receive(ByteBuffer)` / `send(ByteBuffer, address)` 收发；UDP 无连接、有消息边界，不存在粘包但可能丢包乱序。
+
+**SSL/TLS 加密通信**：NIO 下用 `SSLEngine` 做非阻塞握手，`wrap()` / `unwrap()` 在 `ByteBuffer` 之间转换，需要处理 `NEED_TASK`（可能要执行委托任务）、`BUFFER_OVERFLOW`（放大缓冲区）、`BUFFER_UNDERFLOW`（数据不够，等下次读）。手写 `SSLEngine` + Selector 状态机非常复杂，生产上直接用 Netty 的 `SslHandler`。
 
 **select / poll / epoll【核心】**：
 
@@ -338,11 +447,32 @@ IO 模型是理解 Netty、Redis、Kafka 等高性能组件的基础；现代 Ja
 
 epoll 支持水平触发（LT，默认，只要有数据就一直通知）和边缘触发（ET，只在状态变化时通知一次，必须一次读完，Netty 的 epoll 传输用 ET）。
 
-**Reactor 模型【重点】**：单 Reactor 单线程（Redis 6 之前）→ 单 Reactor 多线程 → 主从 Reactor（Netty：BossGroup 负责 accept，WorkerGroup 负责读写）。
+**为什么 epoll 高效**：fd 只在注册时拷贝一次，用红黑树管理；内核通过回调把就绪 fd 放进就绪队列，`epoll_wait` 只返回就绪的那几个，开销与活跃连接数相关而不是总连接数。
 
-**零拷贝【重点】**：传统的「读文件 + 发网络」有 4 次拷贝和 4 次上下文切换。`mmap` 把内核缓冲区映射到用户空间，省一次 CPU 拷贝（RocketMQ 用它读写 CommitLog）；`sendfile` 直接在内核中从文件传到 socket，配合 DMA gather 可以做到零 CPU 拷贝（Kafka 用 `transferTo`）。`DirectByteBuffer` 分配堆外内存，也能少一次堆内到堆外的拷贝。
+### 5.5 Reactor 模型【重点】
 
-### 5.2 现代 Java 特性【了解】
+单 Reactor 单线程（Redis 6 之前）→ 单 Reactor 多线程（业务丢线程池，Accept 与读写仍在一个 Reactor）→ 主从 Reactor（Netty：`BossGroup` 负责 accept，`WorkerGroup` 负责读写）。
+
+- **单 Reactor 单线程**：实现最简单，任一慢操作阻塞全链路，无法利用多核。
+- **单 Reactor 多线程**：I/O 与业务分离，但一个 Reactor 仍要处理所有连接的读写事件，高并发下是瓶颈。
+- **主从 Reactor**：Accept 与读写分离，是最主流的高并发网络模型，详见 Netty 文档第一章。
+
+### 5.6 零拷贝【重点】
+
+传统的「读文件 + 发网络」有 4 次拷贝和 4 次上下文切换。`mmap` 把内核缓冲区映射到用户空间，省一次 CPU 拷贝（RocketMQ 用它读写 CommitLog）；`sendfile` 直接在内核中从文件传到 socket，配合 DMA gather 可以做到零 CPU 拷贝（Kafka 用 `transferTo`）。`DirectByteBuffer` 分配堆外内存，也能少一次堆内到堆外的拷贝。
+
+### 5.7 异步通道与 NIO.2 异步 I/O【了解】
+
+`AsynchronousFileChannel`、`AsynchronousSocketChannel`、`AsynchronousServerSocketChannel` 发起读写后立即返回，结果通过两种方式获取：
+
+| 方式 | 写法 | 特点 |
+| --- | --- | --- |
+| `Future` | `Future<Integer> f = channel.read(...)`，再 `f.get()` | 写法简单，但 `get()` 会阻塞，容易退化成同步 |
+| `CompletionHandler` | `channel.read(buf, pos, attachment, handler)` | 回调式，真正异步；`completed` 成功、`failed` 处理异常 |
+
+注意 Linux 上 JDK 的异步文件通道是**用线程池模拟**的（并非内核 AIO），所以「AIO 比 NIO 快」并不成立；这也是 Netty 选择 NIO 而不是 AIO 的原因之一——AIO 在 Linux 上不成熟、编程复杂、性能优势不明显。
+
+### 5.8 现代 Java 特性【了解】
 
 | 版本 | 重要特性 |
 | --- | --- |
@@ -371,7 +501,7 @@ double area(Shape s) {
 
 ## 六、高频面试题与自测清单
 
-下面 16 道题覆盖图谱中全部「核心」知识点。这部分题目答案短，加分点在于能说出源码细节和实际踩过的坑。
+下面 24 道题覆盖图谱中全部「核心」知识点。这部分题目答案短，加分点在于能说出源码细节和实际踩过的坑。
 
 ### 6.1 高频面试题
 
@@ -393,6 +523,14 @@ double area(Shape s) {
 | 14 | HashMap 为什么线程不安全？ | 1.7 头插死循环；1.8 覆盖丢数据、size 不准 | 四 |
 | 15 | 怎么用 LinkedHashMap 实现 LRU？ | accessOrder + removeEldestEntry | 四 |
 | 16 | BIO、NIO、AIO 的区别？epoll 为什么高效？ | 阻塞 vs 多路复用 vs 异步；就绪队列、不重复拷贝 | 五 |
+| 17 | Buffer 的 flip、clear、compact 有什么区别？compact 什么时候用？ | 切换读写模式 / 丢弃重写 / 保留未读数据继续写 | 五 |
+| 18 | 直接缓冲区和非直接缓冲区的区别？堆外内存回收延迟怎么处理？ | 少一次拷贝但分配回收贵；池化复用、限制 MaxDirectMemorySize | 五 |
+| 19 | slice、duplicate 与 Scattering Reads / Gathering Writes 的作用？ | 共享底层内存的视图；一次系统调用读写多个 Buffer | 五 |
+| 20 | Selector 的三个 select 方法区别？怎么安全取消 key 并关闭 Channel？ | 阻塞 / 立即返回 / 超时；先 cancel 再 close，遍历时用 Iterator.remove | 五 |
+| 21 | 为什么常驻注册 OP_WRITE 会导致 CPU 空转？ | 写缓冲区几乎总是可写；只在写不完时注册、写完取消 | 五 |
+| 22 | FileChannel 怎么实现大文件高效读写与通道间传输？ | 固定 ByteBuffer 循环、transferTo、MappedByteBuffer 随机访问 | 五 |
+| 23 | MappedByteBuffer、WatchService、FileLock 各有什么坑？ | mmap 回收时机不确定；inotify 事件合并；FileLock 是进程间锁 | 五 |
+| 24 | NIO.2 异步通道怎么用？为什么 Netty 选择 NIO 而不是 AIO？ | Future 会阻塞、CompletionHandler 真异步；Linux 上 AIO 由线程池模拟 | 五 |
 
 ### 6.2 动手实验
 
@@ -402,6 +540,9 @@ double area(Shape s) {
 - [ ] 在 foreach 中删除元素复现 `ConcurrentModificationException`，再用 removeIf 修复
 - [ ] 不用 LinkedHashMap，用 HashMap + 双向链表手写 LRU
 - [ ] 用 NIO 的 Selector 写一个简单的 Echo 服务器
+- [ ] 用同一个 ByteBuffer 连续执行 `write → flip → read → compact → write`，打印每一步的 position / limit
+- [ ] 用 `FileChannel.transferTo` 与普通流复制一个 1GB 文件，对比耗时
+- [ ] 用 `WatchService` 监控一个目录，观察创建 / 修改 / 删除事件的触发次数
 
 ### 6.3 自测清单
 
@@ -411,3 +552,6 @@ double area(Shape s) {
 - [ ] 能对比 5 种 Map 的顺序、null 支持和线程安全性
 - [ ] 能说出 3 个以上集合工具方法的坑（Arrays.asList、toMap、subList 等）
 - [ ] 能讲清 epoll 比 select 高效的原因，以及它与 Netty、Redis 的关系
+- [ ] 能在白板上写出 flip / clear / compact 对 position 与 limit 的变化
+- [ ] 能解释为什么「NIO 是非阻塞但仍属于同步 I/O」
+- [ ] 能说出 Selector 事件循环里三个容易踩的坑（OP_WRITE 空转、忘记 Iterator.remove、关闭后操作已取消的 key）

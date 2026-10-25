@@ -409,11 +409,47 @@ MyBatis 允许用 `Interceptor` 拦截四大对象：**Executor、StatementHandl
 - `<id>` 标签标记主键列，MyBatis 靠它判断多行是否属于同一个外层对象并合并结果，一对多映射必须写，否则会得到重复的父对象。
 - **一对多分页的坑**：JOIN 之后行数被放大，PageHelper 按行做 count 和 LIMIT，导致「每页条数变少、总数变大」。正确做法是先分页查主表，再用主键集合批量查子表，在应用层组装。
 
-### 7.7 动态 SQL 与 MyBatis-Plus【重点】
+### 7.7 动态 SQL 与批量插入【重点】
 
 - **动态 SQL 标签**：`<if>`、`<choose>/<when>/<otherwise>`、`<where>`（自动去掉多余的 AND）、`<set>`、`<foreach>`（IN 查询、批量插入）、`<trim>`。
-- **MyBatis-Plus**：在 MyBatis 基础上提供通用 CRUD（`BaseMapper`、`IService`）、条件构造器（`LambdaQueryWrapper`，用方法引用避免字段名写错）、分页插件、逻辑删除（`@TableLogic`）、乐观锁插件（`@Version`）、自动填充创建时间等。
 - **批量插入优化【了解】**：循环单条 insert 最慢；`<foreach>` 拼成一条多值 INSERT 较快，但 SQL 不宜超过 `max_allowed_packet`；BATCH Executor + JDBC URL 加 `rewriteBatchedStatements=true` 通常最快。MyBatis-Plus 的 `saveBatch` 用的就是 BATCH 模式。
+
+### 7.8 MyBatis-Plus【重点】
+
+MyBatis-Plus（MP）的定位是「只做增强不做改变」：不替换 MyBatis，只在启动时把 `MybatisSqlSessionFactoryBean` 换掉并注入一批拦截器，所以原有 XML、`resultMap`、插件都能继续用。
+
+**通用 CRUD**：`BaseMapper<T>` 提供 `insert`、`deleteById`、`deleteByMap`、`delete`（Wrapper）、`deleteBatchIds`、`updateById`、`update`（Wrapper）、`selectById`、`selectBatchIds`、`selectOne`、`selectCount`、`selectList`、`selectMaps`、`selectPage`、`selectObjs` 等；`IService<T>` / `ServiceImpl<M, T>` 在其上再封装 `save`、`saveBatch`、`saveOrUpdate`、`remove`、`update`、`list`、`page`。简单单表 CRUD 不用写 SQL，复杂查询仍然写 XML。
+
+**条件构造器**：
+
+| 类型 | 特点 | 场景 |
+| --- | --- | --- |
+| `QueryWrapper` | 字符串列名 | 快速拼装，列名写错只能运行期报错 |
+| `LambdaQueryWrapper` | 方法引用 `User::getName` | **推荐**，编译期检查字段 |
+| `UpdateWrapper` / `LambdaUpdateWrapper` | 支持 `set` 与条件 | 需要把字段更新为 null 时只能用 Wrapper |
+| `ChainWrapper` | 链式调用 `lambdaQuery()` | 代码更短 |
+
+常用方法 `eq/ne/gt/ge/lt/le/like/between/in/inSql/isNull/orderByAsc/groupBy/having`，以及每个方法都有的 `condition` 重载（`eq(flag, ...)`，条件不成立时不拼该片段）。`apply("date_format(create_time,'%Y') = {0}", 2026)` 支持参数占位，**不要直接拼字符串**，否则就是 SQL 注入。
+
+**分页插件**：注册 `MybatisPlusInterceptor`，加入 `PaginationInnerInterceptor`，必须显式指定 `DbType`（否则靠 JDBC URL 猜）。原理是拦截 `Executor.query`，先跑一条 `count` SQL，再把原 SQL 改写成 `LIMIT offset, size`——是**物理分页**。`optimizeJoin` 默认可在 count 时去掉不必要的 join；`maxLimit` 防止一次查太多。多个内部拦截器有顺序要求：**分页放最后**，多租户、数据权限等要在它之前，否则 SQL 已经被加上 limit 就改不动了。
+
+**逻辑删除**：`@TableLogic` 标注字段（或全局配置 `logic-delete-field`），查询自动追加 `is_deleted = 0`，`delete` 变成 `UPDATE ... SET is_deleted = 1`。注意：手写 XML / 自定义 SQL **不会自动生效**；逻辑删除字段参与唯一索引会导致「删了不能再建同名记录」，需要把删除标记或时间纳入唯一键。
+
+**乐观锁**：`@Version` + `OptimisticLockerInnerInterceptor`，更新时必须走 `updateById` 或带 version 条件的 `update`，MP 自动 `SET version = version + 1 WHERE version = 旧值`，影响行数为 0 表示冲突，业务层重试。
+
+**其他常用能力**：
+
+| 能力 | 用法 | 备注 |
+| --- | --- | --- |
+| 自动填充 | `MetaObjectHandler` + `@TableField(fill = INSERT/INSERT_UPDATE)` | 创建时间、更新人 |
+| 主键策略 | `@TableId(type = IdType.AUTO/ASSIGN_ID/INPUT)` | 默认雪花 `ASSIGN_ID`，容器化要注意 workerId |
+| 多租户 | `TenantLineInnerInterceptor` | 自动拼 `tenant_id`，忽略表与自定义 SQL 要单独处理 |
+| 防全表更新 | `BlockAttackInnerInterceptor` | 拦截没有 where 的 update / delete |
+| 字段类型处理器 | `@TableField(typeHandler = JacksonTypeHandler.class)` + `autoResultMap = true` | JSON 字段映射为对象 |
+| 代码生成器 | `mybatis-plus-generator` | 逆向生成 Entity / Mapper / Service |
+| SQL 性能分析 | 旧 `PerformanceInterceptor` 已移除 | 生产用 p6spy 或 Druid 监控 |
+
+**常见坑**：`updateById` 默认忽略 null 字段（要把字段置空需用 `UpdateWrapper.set` 或 `@TableField(updateStrategy = FieldStrategy.IGNORED)`）；`saveBatch` 默认 1000 条一批，事务要自己加；Wrapper 与 XML 混用时注意 `@Param(Constants.WRAPPER)`；`selectOne` 查到多条会抛异常。
 
 ## 八、设计模式与扩展点
 
@@ -538,6 +574,37 @@ SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
 
 **越权**：URL / 方法级授权判断不了「这条数据是不是你的」。按 ID 查询或修改的接口必须校验 `owner_id = 当前用户`，复杂场景用 MyBatis 拦截器自动拼数据权限条件；导出、下载同样要做归属校验，且 ID 不要可枚举。
 
+**RBAC 权限模型【重点】**：核心是把权限从用户身上剥离，通过角色间接授予——调整权限只动角色，不用逐人修改。
+
+| 层级 | 增加的能力 | 典型场景 |
+| --- | --- | --- |
+| RBAC0 | 用户-角色-权限，用户与角色、角色与权限均多对多 | 绝大多数后台系统 |
+| RBAC1 | 角色继承（角色树），上级角色自动拥有下级权限 | 总部 / 分公司、岗位层级 |
+| RBAC2 | 约束：互斥角色、基数约束、先决条件 | 财务与审计不可兼任；审批角色最多 3 人 |
+| RBAC3 | RBAC1 + RBAC2 | 大型组织 |
+
+**标准五张表**：`user`、`role`、`permission`（菜单 / 按钮 / 接口统一抽象成权限码）、`user_role`、`role_permission`；需要数据权限时再加 `dept` 与 `role_dept`（角色可见的部门范围）。
+
+**权限码设计**：用「资源:动作」，如 `order:read`、`order:export`。后端按权限码鉴权，前端按菜单树渲染。角色只是权限的集合，代码里不要写死 `hasRole("ADMIN")`，否则新增角色就要改代码。
+
+**数据权限**：接口级授权只回答「能不能调这个接口」，数据权限回答「能看到哪些行」。
+
+| 做法 | 实现 | 优缺点 |
+| --- | --- | --- |
+| SQL 拼条件 | MyBatis 拦截器读注解，给 SQL 追加 `dept_id IN (...)` 或 `create_by = 当前用户` | 统一、业务无感；需处理表别名与字段白名单，多表 join 容易错 |
+| 应用层过滤 | 查出来后在内存中过滤 | 简单，但大数据量浪费内存带宽，**分页会不准** |
+| 数据库行级安全 | PostgreSQL RLS、专用视图 | 数据库兜底，MySQL 不支持 |
+| 数据范围枚举 | 全部 / 本部门 / 本部门及下级 / 本人 / 自定义 | 国内后台最常用，配合部门树与角色配置 |
+
+```java
+@DataScope(deptAlias = "d", userAlias = "u")
+public List<OrderVO> list(OrderQuery query) { return orderMapper.selectList(query); }
+```
+
+拦截器解析 `@DataScope` 拿到 `dataScope` 与部门集合，在 `beforeQuery` 里拼条件，超管直接跳过。字段名必须来自注解白名单，**不能由前端传入**。
+
+**与越权的关系**：水平越权靠「归属校验」（`owner_id`、`dept_id` 精确匹配），数据权限靠「范围过滤」，两者都要有；导出、下载、详情接口同样适用。
+
 ### 9.6 密码、会话与 CSRF【了解】
 
 - **BCrypt**：自带随机盐、慢哈希，`strength` 默认 10；同一明文每次结果不同，校验用 `matches()`。Spring Security 5 起默认 `DelegatingPasswordEncoder`，密文带 `{bcrypt}` 前缀，便于平滑迁移算法。禁止 MD5、SHA-1、明文和固定盐。
@@ -547,7 +614,7 @@ SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
 
 ## 十、高频面试题与自测清单
 
-下面 24 道题覆盖图谱中全部「核心」知识点。Spring 题目的加分方式是能说出关键类名和方法名（如 `refresh`、`singletonFactories`、`TransactionInterceptor`），说明看过源码。
+下面 26 道题覆盖图谱中全部「核心」知识点。Spring 题目的加分方式是能说出关键类名和方法名（如 `refresh`、`singletonFactories`、`TransactionInterceptor`），说明看过源码。
 
 ### 10.1 高频面试题
 
@@ -577,6 +644,8 @@ SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
 | 22 | JWT 怎么续期和注销？ | 双 Token / 滑动续期 / Redis；jti 黑名单、用户版本号；指定算法防 alg 混淆 | 九 |
 | 23 | OAuth2 授权码模式流程？为什么不用隐式模式？ | 跳转授权 → 回调带 code → 后端用 code + secret 换 token；隐式模式 Token 暴露在浏览器 | 九 |
 | 24 | 水平越权和 CSRF 怎么防？ | 校验 owner / 数据权限拦截器；CSRF Token、SameSite，JWT 放 Header 时可关闭 | 九 |
+| 25 | MyBatis-Plus 的分页、逻辑删除、乐观锁怎么实现？有什么坑？ | 拦截 Executor 改写成 limit；@TableLogic 只对内置方法生效；@Version 需走 updateById | 七 |
+| 26 | RBAC 怎么设计？RBAC0~RBAC3 区别？数据权限怎么实现？ | 用户-角色-权限五张表；角色继承与约束；拦截器拼部门条件 + 归属校验 | 九 |
 
 ### 10.2 动手实验
 
@@ -588,6 +657,8 @@ SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
 - [ ] 用 `--debug` 启动一个 Boot 应用，读懂自动配置的条件评估报告
 - [ ] 开启 `logging.level.org.springframework.security=DEBUG`，登录一次，观察 Security 过滤器链的执行日志
 - [ ] 用 `OncePerRequestFilter` 实现 JWT 认证，验证无 Token / 过期 Token 分别返回 401
+- [ ] 用 MP 写一个带逻辑删除、乐观锁、自动填充的实体，构造并发更新验证 version 冲突
+- [ ] 写一个 `@DataScope` 注解 + MyBatis 拦截器，给查询自动追加部门条件
 
 ### 10.3 自测清单
 
@@ -599,3 +670,5 @@ SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
 - [ ] 能列出 Spring 中用到的 6 种以上设计模式及对应的类
 - [ ] 能按顺序说出 Security 过滤器链中认证、授权、异常处理三个关键过滤器及其相对位置
 - [ ] 能讲完认证 8 步流程，并解释 JWT 为什么无法主动注销及两种解决方案
+- [ ] 能说清 MP 分页插件的改写时机，以及为什么分页拦截器要放在最后
+- [ ] 能画出 RBAC 五张表，并说清接口级权限与数据权限的区别
