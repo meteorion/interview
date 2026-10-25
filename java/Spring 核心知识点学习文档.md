@@ -4,7 +4,7 @@ Oct 15, 2026 · @meteorzhong
 
 ## 导读
 
-本文展开《知识图谱.html》「Web 与框架」分类中的 6 个节点（含 Spring Security），并对齐《Java开发工程师核心知识点.md》第五章与第十五章的认证授权部分。标注沿用图谱：**【核心】** 面试必问；**【重点】** 常被追问；**【了解】** 知道概念即可。默认版本为 Spring 6 / Spring Boot 3（要求 JDK 17，`javax.*` 迁移到 `jakarta.*`）。Spring Cloud 相关内容放在后续的分布式文档中，Netty 见《Netty 核心知识点学习文档.md》。
+本文展开《知识图谱.html》「Web 与框架」分类中的 6 个节点（含 Spring Security）。标注沿用图谱：**【核心】** 面试必问；**【重点】** 常被追问；**【了解】** 知道概念即可。默认版本为 Spring 6 / Spring Boot 3（要求 JDK 17，`javax.*` 迁移到 `jakarta.*`）。Spring Cloud 相关内容放在后续的分布式文档中，Netty 见《Netty 核心知识点学习文档.md》。
 
 | 图谱节点 | 级别 | 本文章节 |
 | --- | --- | --- |
