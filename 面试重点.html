@@ -900,6 +900,10 @@ a{color:inherit}
   var state = { query: '', level: 'all', cat: 'all', open: null };
   var items = [];
   var sections = [];
+  var questionsById = {};
+  data.questions.forEach(function (q) {
+    questionsById[q.i] = q;
+  });
 
   function esc(value) {
     return String(value == null ? '' : value)
@@ -968,7 +972,7 @@ a{color:inherit}
     content.innerHTML = html;
 
     items = Array.prototype.slice.call(content.querySelectorAll('.qa')).map(function (el) {
-      var q = data.map[el.getAttribute('data-id')];
+      var q = questionsById[el.getAttribute('data-id')];
       var hay = [q.q, q.c, q.h, q.a].join(' ').toLowerCase();
       return { el: el, q: q, hay: hay };
     });
